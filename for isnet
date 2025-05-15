@@ -1,0 +1,1097 @@
+import os
+os.system('cls' if os.name == 'nt' else 'clear')  
+os.environ['SDL_VIDEO_CENTERED'] = '1'
+import sys
+import re
+import time
+import math
+import json
+import threading
+import logging
+from datetime import datetime
+import pandas as pd
+import PyPDF2
+import ezodf
+from odf.opendocument import load
+from odf.text import P
+from docx import Document
+import xml.etree.ElementTree as ET
+import requests
+from bs4 import BeautifulSoup
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+from dotenv import load_dotenv
+import openai
+import pyttsx3
+import speech_recognition as sr
+from google.cloud import texttospeech
+from google.auth.exceptions import DefaultCredentialsError
+from mutagen.mp3 import MP3
+import hashlib
+from pathlib import Path
+import pygame
+from PIL import Image, ImageSequence
+import cv2
+import pytesseract
+from difflib import get_close_matches
+import win32gui
+import win32con
+
+def setup_logging(log_dir: str, log_filename: str = "my_app.log", level=logging.INFO):
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, log_filename)
+    logger = logging.getLogger()
+    logger.setLevel(level)
+    logger.propagate = False 
+    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    file_handler = logging.FileHandler(log_path, mode='a', encoding='utf-8')
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(level)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(level)
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    logger.info("Logging configuration completed.")
+    return logger
+
+LOG_DIR = r"C:\Users\tsifa\Desktop\V.S Code\.venv\logging"
+logger = setup_logging(LOG_DIR)
+OCR_LANGUAGES: str = "ell+eng"
+current_language: str = "el"
+dotenv_path = ".env"
+dotenv_path: str = r"C:\Users\tsifa\Desktop\V.S Code\.venv\.env"
+credentials_path: str = r"C:\Users\tsifa\Desktop\V.S Code\river-module-455811-r1-103125979ff2.json"
+image_path: str = r"C:\Users\tsifa\Desktop\V.S Code\.venv\assets\avatar_1.gif"
+background_image_path: str = r"C:\Users\tsifa\Desktop\V.S Code\.venv\assets\tsifakis1.webp"
+current_topic: str | None = None
+running: bool = True
+avatar_text: str = ""
+avatar_lock = threading.Lock()
+current_display_duration: float = 1.5
+last_text_update_time: float = time.time()
+CACHE_DIR = Path(__file__).parent / "tts_cache"
+CACHE_DIR.mkdir(exist_ok=True)                      
+logger = logging.getLogger(__name__)
+recognizer = sr.Recognizer()
+microphone = sr.Microphone()
+mic_status_text: str = ""
+DEFAULT_TIMEOUT = 2
+DEFAULT_PHRASE_TIME_LIMIT = 10
+DEFAULT_PAUSE_THRESHOLD = 1.8
+current_topic = None
+waiting_for_wake_word = False
+MAX_WAKE_ATTEMPTS = 5  
+wake_word_attempts = 0
+cached_company_context: str | None = None
+last_load_time: float | None = None
+last_user_text: str = ""
+
+def update_last_user_text(text: str):
+    global last_user_text
+    last_user_text = text
+
+def exit_if_missing_env(api_key, org_id):
+    if not api_key or not org_id:
+        logging.error("Λείπουν τα OPENAI_API_KEY ή OPENAI_ORG_ID από το αρχείο .env.")
+        sys.exit("Λείπουν τα OPENAI_API_KEY ή OPENAI_ORG_ID από το αρχείο .env.")
+
+def validate_openai_credentials():
+    try:
+        logging.info("Δοκιμή σύνδεσης με OpenAI.")
+        openai.models.list()  
+        logging.info("OpenAI API key: Έγκυρο.")
+    except openai.error.AuthenticationError as e:
+        logging.error(f"Σφάλμα πιστοποίησης OpenAI API: {e}")
+        sys.exit(f"Σφάλμα πιστοποίησης OpenAI API: {e}")
+    except Exception as e:
+        logging.exception(f"Άγνωστο σφάλμα OpenAI: {e}")
+        sys.exit(f"Άγνωστο σφάλμα OpenAI: {e}")
+
+def validate_google_tts(credentials_path):
+    if not os.path.exists(credentials_path):
+        logging.error(f"Το αρχείο credentials Google TTS δεν βρέθηκε: {credentials_path}")
+        sys.exit(f"Το αρχείο credentials Google TTS δεν βρέθηκε: {credentials_path}")
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = credentials_path
+    try:
+        logging.info("Δοκιμή σύνδεσης με Google TTS...")
+        _ = texttospeech.TextToSpeechClient()
+        logging.info("Google TTS API: Έγινε σωστή σύνδεση.")
+    except DefaultCredentialsError as e:
+        logging.error(f"Σφάλμα credentials Google TTS: {e}")
+        sys.exit(f"Σφάλμα credentials Google TTS: {e}")
+    except Exception as e:
+        logging.exception(f"Άγνωστο σφάλμα Google TTS: {e}")
+        sys.exit(f"Άγνωστο σφάλμα Google TTS: {e}")
+
+def validate_avatar_image(image_path):
+    logging.info(f"Έλεγχος ύπαρξης avatar: {image_path}")
+    if not os.path.exists(image_path):
+        logging.error(f"Το αρχείο avatar δεν βρέθηκε: {image_path}")
+        sys.exit(f"Το αρχείο avatar δεν βρέθηκε: {image_path}")
+    logging.info("Το αρχείο avatar βρέθηκε.")
+
+def initialize_services():
+    logging.info("Φόρτωση μεταβλητών περιβάλλοντος (.env)...")
+    load_dotenv(dotenv_path=dotenv_path)
+    api_key = os.getenv("OPENAI_API_KEY")
+    org_id = os.getenv("OPENAI_ORG_ID")
+    exit_if_missing_env(api_key, org_id)
+    openai.api_key = api_key
+    openai.organization = org_id
+    validate_openai_credentials()
+    validate_google_tts(credentials_path)
+    validate_avatar_image(image_path)
+    logging.info("Όλες οι υπηρεσίες αρχικοποιήθηκαν επιτυχώς!")
+initialize_services()
+
+def read_txt(file_path):
+    logging.debug(f"read_txt() καλείται για το αρχείο: {file_path}")
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            data = f.read()
+        logging.debug(f"Μέγεθος δεδομένων TXT: {len(data)} χαρακτήρες")
+        return data
+    except Exception as e:
+        logging.error(f"Σφάλμα TXT: {e}")
+        return f"Σφάλμα TXT: {e}"
+
+def read_excel(file_path):
+    logging.debug(f"read_excel() για {file_path}")
+    try:
+        df = pd.read_excel(file_path)
+        return df.to_string()
+    except Exception as e:
+        logging.error(f"Σφάλμα EXCEL: {e}")
+        return f"Σφάλμα EXCEL: {e}"
+
+def read_csv(file_path):
+    logging.debug(f"read_csv() για {file_path}")
+    try:
+        df = pd.read_csv(file_path)
+        return df.to_string()
+    except Exception as e:
+        logging.error(f"Σφάλμα CSV: {e}")
+        return f"Σφάλμα CSV: {e}"
+
+def read_json(file_path):
+    logging.debug(f"read_json() για {file_path}")
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        logging.debug(f"Επιτυχής φόρτωση JSON. Keys: {list(data.keys()) if isinstance(data, dict) else 'Δεν είναι dict'}")
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logging.error(f"Σφάλμα JSON: {e}")
+        return f"Σφάλμα JSON: {e}"
+
+def read_xml(file_path):
+    logging.debug(f"read_xml() για {file_path}")
+    try:
+        tree = ET.parse(file_path)
+        root = tree.getroot()
+        return ET.tostring(root, encoding='unicode')
+    except Exception as e:
+        logging.error(f"Σφάλμα XML: {e}")
+        return f"Σφάλμα XML: {e}"
+
+def read_docx(file_path):
+    logging.debug(f"read_docx() για {file_path}")
+    try:
+        doc = Document(file_path)
+        return "\n".join([para.text for para in doc.paragraphs])
+    except Exception as e:
+        logging.error(f"Σφάλμα DOCX: {e}")
+        return f"Σφάλμα DOCX: {e}"
+
+def read_pdf(file_path):
+    logging.debug(f"read_pdf() για {file_path}")
+    try:
+        text = ""
+        with open(file_path, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            for page in reader.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+        return text
+    except Exception as e:
+        logging.error(f"Σφάλμα PDF: {e}")
+        return f"Σφάλμα PDF: {e}"
+
+def read_odt(file_path):
+    logging.debug(f"read_odt() για {file_path}")
+    try:
+        doc = load(file_path)
+        paragraphs = doc.getElementsByType(P)
+        return "\n".join([str(p.firstChild) for p in paragraphs if p.firstChild])
+    except Exception as e:
+        logging.error(f"Σφάλμα ODT: {e}")
+        return f"Σφάλμα ODT: {e}"
+
+def read_ods(file_path):
+    logging.debug(f"read_ods() για {file_path}")
+    try:
+        ezodf.config.set_table_expand_strategy('all')
+        doc = ezodf.opendoc(file_path)
+        sheet = doc.sheets[0]
+        data = []
+        for row in sheet.rows():
+            row_data = [cell.value if cell.value is not None else "" for cell in row]
+            data.append("\t".join(map(str, row_data)))
+        return "\n".join(data)
+    except Exception as e:
+        logging.error(f"Σφάλμα ODS: {e}")
+        return f"Σφάλμα ODS: {e}"
+
+def read_image(file_path):
+    logging.debug(f"read_image() για OCR, αρχείο: {file_path}")
+    try:
+        image = Image.open(file_path)
+        return pytesseract.image_to_string(image, lang=OCR_LANGUAGES)
+    except Exception as e:
+        logging.error(f"Σφάλμα OCR εικόνας: {e}")
+        return f"Σφάλμα OCR εικόνας: {e}"
+
+def read_html(file_path):
+    logging.debug(f"read_html() για {file_path}")
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            soup = BeautifulSoup(f.read(), 'html.parser')
+            return soup.get_text()
+    except Exception as e:
+        logging.error(f"Σφάλμα HTML: {e}")
+        return f"Σφάλμα HTML: {e}"
+
+def read_website(url):
+    logging.info(f"Προσπάθεια φόρτωσης website: {url}")
+    try:
+        response = requests.get(url, verify=False, timeout=6)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        for element in soup(["script", "style", "meta", "noscript", "header", "footer"]):
+            element.decompose()
+        return soup.get_text(separator="\n", strip=True)
+    except Exception as e:
+        logging.error(f"Σφάλμα στην ανάγνωση ιστοσελίδας {url}: {e}")
+        return f"Σφάλμα στην ανάγνωση ιστοσελίδας {url}: {e}"
+
+def load_company_info():
+    folder_path = r"C:\Users\tsifa\Desktop\V.S Code\.venv\company folder"
+    company_info = ""
+    extension_readers = {
+        ".txt": read_txt,
+        ".pdf": read_pdf,
+        ".xls": read_excel,
+        ".xlsx": read_excel,
+        ".csv": read_csv,
+        ".json": read_json,
+        ".xml": read_xml,
+        ".docx": read_docx,
+        ".ods": read_ods,
+        ".odt": read_odt,
+        ".png": read_image,
+        ".jpg": read_image,
+        ".jpeg": read_image,
+        ".webp": read_image,
+        ".html": read_html,}
+    logging.info(f"Φόρτωση εταιρικών αρχείων από το φάκελο: {folder_path}")
+    for file in os.listdir(folder_path):
+        file_path = os.path.join(folder_path, file)
+        if os.path.isfile(file_path):
+            ext = os.path.splitext(file)[1].lower()
+            reader = extension_readers.get(ext)
+            if reader:
+                try:
+                    logging.info(f"Ανάγνωση αρχείου: {file_path}")
+                    company_info += reader(file_path) + "\n"
+                except Exception as e:
+                    logging.warning(f"Σφάλμα στην ανάγνωση {file_path}: {e}")
+            else:
+                logging.info(f"Δεν υπάρχει reader για το αρχείο: {file_path}")
+    websites = ["https://isnet.gr/"]
+    for url in websites:
+        logging.info(f"Ανάγνωση ιστοσελίδας: {url}")
+        company_info += read_website(url) + "\n"
+    return company_info
+
+def detect_motion(threshold=15000, warmup_time=2, max_attempts=None, consecutive_frames_required=5):
+    logging.info("Έναρξη detect_motion().")
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        logging.error("Δεν ήταν δυνατή η πρόσβαση στην κάμερα.")
+        sys.exit()
+    logging.info("Προετοιμασία κάμερας.")
+    time.sleep(warmup_time)
+    backSub = cv2.createBackgroundSubtractorMOG2()
+    for _ in range(30):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        backSub.apply(frame)
+        time.sleep(0.05)
+    motion_detected = False
+    consecutive_motion_frames = 0
+    attempts = 0
+    logging.info("Ανίχνευση κίνησης σε εξέλιξη.")
+    try:
+        while max_attempts is None or attempts < max_attempts:
+            ret, frame = cap.read()
+            if not ret:
+                logging.warning("Απώλεια σύνδεσης με την κάμερα.")
+                break
+            fgMask = backSub.apply(frame)
+            contours, _ = cv2.findContours(fgMask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            total_area = sum(cv2.contourArea(c) for c in contours if cv2.contourArea(c) > 100)
+            logging.debug(f"Frame {attempts}, total_area: {total_area}")
+            if total_area > threshold:
+                consecutive_motion_frames += 1
+                logging.debug(f"Συνεχόμενα frames με κίνηση: {consecutive_motion_frames}")
+                if consecutive_motion_frames >= consecutive_frames_required:
+                    logging.info("Ανιχνεύτηκε κίνηση!")
+                    motion_detected = True
+                    break
+            else:
+                consecutive_motion_frames = 0
+            attempts += 1
+        if not motion_detected:
+            logging.info("Δεν ανιχνεύθηκε κίνηση. Αναμονή για 'q' ή Ctrl+C.")
+            while True:
+                key = cv2.waitKey(1000)
+                if key == ord('q'):
+                    logging.info("Έξοδος από το idle mode.")
+                    break
+    except KeyboardInterrupt:
+        logging.info("Έγινε διακοπή από τον χρήστη.")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        logging.info(f"detect_motion() -> motion_detected={motion_detected}")
+    return motion_detected
+
+def idle_motion_mode(screen, clock, threshold=5000, warmup_time=1, consecutive_frames_required=5):
+    logging.info("Entering idle_motion_mode().")
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        logging.error("Δεν ήταν δυνατή η πρόσβαση στην κάμερα για idle λειτουργία.")
+        return
+    time.sleep(warmup_time)
+    backSub = cv2.createBackgroundSubtractorMOG2()
+    consecutive_count = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        fgMask = backSub.apply(frame)
+        contours, _ = cv2.findContours(fgMask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        total_area = sum(cv2.contourArea(c) for c in contours if cv2.contourArea(c) > 100)
+        if total_area > threshold:
+            consecutive_count += 1
+        else:
+            consecutive_count = 0
+        if consecutive_count >= consecutive_frames_required:
+            logging.info("Εντοπίστηκε κίνηση στην idle λειτουργία.")
+            break
+        time.sleep(0.1)
+    cap.release()
+    cv2.destroyAllWindows()
+    maximize_window()
+    fade_in(screen, clock, duration=0.5)
+    global waiting_for_wake_word
+    waiting_for_wake_word = True
+    logging.info("Το avatar επανήλθε λόγω ανίχνευσης κίνησης. Σε αναμονή για wake word.")
+
+def get_hwnd():
+    try:
+        return pygame.display.get_wm_info()["window"]
+    except Exception as e:
+        logging.error(f"Σφάλμα απόκτησης HWND: {e}")
+        return None
+
+def minimize_window():
+    logging.info("Ελαχιστοποίηση παραθύρου.")
+    hwnd = get_hwnd()
+    if hwnd:
+        win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+        logging.info("Το παράθυρο ελαχιστοποιήθηκε.")
+
+def maximize_window():
+    logging.info("Επαναφορά παραθύρου.")
+    hwnd = get_hwnd()
+    if hwnd:
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        logging.info("Το παράθυρο επανήλθε.")
+
+def calculate_display_duration(text, min_duration=2.0, max_duration=10.0, chars_per_second=20):
+    estimated = len(text) / chars_per_second
+    return max(min_duration, min(estimated, max_duration))
+
+def _fade(screen, clock, duration, direction="in"):
+    logging.debug(f"_fade() καλείται, direction={direction}, duration={duration}")
+    try:
+        fps = 5
+        steps = int(duration * fps)
+        width, height = screen.get_size()
+        overlay = pygame.Surface((width, height))
+        overlay.fill(current_theme["background_color"])
+        range_steps = reversed(range(steps)) if direction == "in" else range(steps)
+        for i in range_steps:
+            alpha = int((i / steps) * 255)
+            overlay.set_alpha(alpha)
+            screen.blit(overlay, (0, 0))
+            pygame.display.update()
+            clock.tick(fps)
+    except Exception as e:
+        logging.error(f"Σφάλμα κατά το fade {direction}: {e}")
+
+def fade_in(screen, clock, duration=0.1):
+    logging.debug("Κλήση fade_in()")
+    _fade(screen, clock, duration, direction="in")
+
+def fade_out(screen, clock, duration=0.1):
+    logging.debug("Κλήση fade_out()")
+    _fade(screen, clock, duration, direction="out")
+
+def create_avatar_animation(image_path):
+    logging.info(f"create_avatar_animation() για: {image_path}")
+    if not os.path.exists(image_path):
+        logging.error(f"Το αρχείο avatar δεν βρέθηκε: {image_path}")
+        sys.exit()
+    try:
+        gif = Image.open(image_path)
+        frames = [
+            pygame.image.fromstring(
+                frame.convert("RGBA").tobytes(), frame.size, "RGBA")
+            for frame in ImageSequence.Iterator(gif)]
+        if not frames:
+            logging.error("Δεν εντοπίστηκαν frames στο avatar.")
+            sys.exit()
+        logging.info(f"Φόρτωση avatar: Βρέθηκαν {len(frames)} frames.")
+        return frames
+    except Exception as e:
+        logging.error(f"Σφάλμα κατά τη φόρτωση avatar animation: {e}")
+        sys.exit()
+
+light_effect = {
+    "enabled": False,
+    "color": (255, 255, 255),
+    "max_alpha": 30,
+    "pulse_speed": 1.5}
+
+def config_light(enabled=None, color=None, max_alpha=None, pulse_speed=None):
+    logging.debug("config_light()")
+    if enabled is not None:
+        light_effect["enabled"] = enabled
+    if color is not None:
+        light_effect["color"] = color
+    if max_alpha is not None:
+        light_effect["max_alpha"] = max_alpha
+    if pulse_speed is not None:
+        light_effect["pulse_speed"] = pulse_speed
+config_light(enabled=False, color=(255, 255, 255), pulse_speed=2.0)
+
+themes = {
+    "default": {
+        "background_color": (255, 255, 255),
+        "bubble_color": (0, 0, 0),
+        "bubble_target_alpha": 150,
+        "text_color": (255, 215, 0),
+        "font_name": "Calibri",
+        "font_size": 24,}}
+current_theme = themes["default"]
+
+def update_avatar_text(new_text):
+    logging.debug(f"update_avatar_text(): {new_text[:60]}.")
+    global avatar_text, last_text_update_time, current_display_duration
+    with avatar_lock:
+        avatar_text = new_text
+        last_text_update_time = time.time()
+        current_display_duration = calculate_display_duration(new_text)
+
+def get_gif_duration_ms(image_path):
+    try:
+        gif = Image.open(image_path)
+        duration = sum(frame.info.get('duration', 100) for frame in ImageSequence.Iterator(gif))
+        return duration / 1000.0  
+    except Exception as e:
+        logging.error(f"Σφάλμα στον υπολογισμό διάρκειας GIF: {e}")
+        return 0.5  
+
+def format_user_text(text):
+    known_names = {"στελλα", "γιάννης", "μαρία", "κώστας", "νίκος", "ελπίδα", "αντώνης", "γεωργία"}
+    sentences = re.split(r'(?<=[.!?;])\s+', text.strip())
+    formatted = []
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        sentence = sentence[0].upper() + sentence[1:]
+        words = sentence.split()
+        for i, word in enumerate(words):
+            clean_word = word.strip(".,;!?").lower()
+            if clean_word in known_names:
+                words[i] = word.capitalize()
+        sentence = " ".join(words)
+        if not sentence.endswith((".", "!", ";", "?")):
+            if sentence.lower().startswith(("τι", "ποιος", "πως", "πότε", "γιατί", "ποιο", "ποια", "πού", "ποιοι", "πόσοι")):
+                sentence += ";"
+            else:
+                sentence += "."
+        formatted.append(sentence)
+    return " ".join(formatted)
+
+def themed_show_avatar(running_check, screen, clock):
+    gif_duration = get_gif_duration_ms(image_path)
+    fade_in_duration = gif_duration
+    fade_out_duration = gif_duration
+    logging.info("Έναρξη themed_show_avatar.")
+    avatar_frames = create_avatar_animation(image_path)
+    frame_index = 0
+    screen_width, screen_height = 1550, 1000
+    screen = pygame.display.set_mode((screen_width, screen_height), pygame.NOFRAME)
+    pygame.display.set_caption("I.S.NET")
+    font = pygame.font.SysFont(current_theme["font_name"], current_theme["font_size"], bold=True)
+    clock = pygame.time.Clock()
+    background_image = None
+    if os.path.exists(background_image_path):
+        try:
+            bg_pil = Image.open(background_image_path).convert("RGB")
+            img_w, img_h = bg_pil.size
+            screen_ratio_w = screen_width / img_w
+            screen_ratio_h = screen_height / img_h
+            scale = max(screen_ratio_w, screen_ratio_h, 1.0)
+            new_w = int(img_w * scale, )
+            new_h = int(img_h * scale, )
+            bg_resized = bg_pil.resize((new_w, new_h), Image.LANCZOS)
+            bg_surface = pygame.image.fromstring(
+            bg_resized.tobytes(), bg_resized.size, "RGB")
+            bg_x = (screen_width  - new_w) // 2
+            bg_y = (screen_height - new_h) // 2
+            background_image = bg_surface
+            logging.info("Εικόνα φόντου φορτώθηκε και κλιμακώθηκε χωρίς παραμόρφωση.")
+        except Exception as e:
+            logging.warning(f"Σφάλμα φόρτωσης background image: {e}")
+    else:
+        logging.warning("Δεν βρέθηκε εικόνα φόντου. Χρήση χρώματος background.")
+
+    def render_text_wrapped(text, font, color, max_width):
+        words = text.split(' ')
+        lines = []
+        current_line = ''
+        for word in words:
+            test_line = current_line + word + ' '
+            if font.size(test_line)[0] <= max_width:
+                current_line = test_line
+            else:
+                lines.append(current_line.strip())
+                current_line = word + ' '
+        if current_line:
+            lines.append(current_line.strip())
+        return [font.render(line, True, color) for line in lines]
+
+    while running_check():
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
+                logging.info("Λήξη themed_show_avatar() λόγω QUIT/ESC.")
+                pygame.quit()
+                global running
+                running = False
+                return
+            elif event.type == pygame.VIDEORESIZE:
+                screen_width, screen_height = event.w, event.h
+        if background_image:
+            screen.blit(background_image, (bg_x, bg_y))
+        else:
+            screen.fill(current_theme["background_color"])
+        current_frame = avatar_frames[frame_index]
+        frame_index = (frame_index + 1) % len(avatar_frames)
+        zoom_factor = 0.40
+        new_width = int(current_frame.get_width() * zoom_factor)
+        new_height = int(current_frame.get_height() * zoom_factor)
+        scaled_frame = pygame.transform.smoothscale(current_frame, (new_width, new_height))
+        avatar_rect = scaled_frame.get_rect(center=(screen_width // 2, screen_height // 2 - 50))
+        screen.blit(scaled_frame, avatar_rect)
+        if light_effect["enabled"]:
+            pulse_alpha = int(abs(math.sin(time.time() * light_effect["pulse_speed"])) * light_effect["max_alpha"])
+            light_overlay = pygame.Surface(current_frame.get_size(), pygame.SRCALPHA)
+            r, g, b = light_effect["color"]
+            light_overlay.fill((r, g, b, pulse_alpha))
+            screen.blit(light_overlay, avatar_rect)
+        with avatar_lock:
+            current_text = avatar_text
+            display_duration = current_display_duration
+            time_updated = last_text_update_time
+        dt = time.time() - time_updated
+        bubble_target_alpha = current_theme["bubble_target_alpha"]
+        if dt < fade_in_duration:
+            bubble_alpha = int((dt / fade_in_duration) * bubble_target_alpha)
+        elif dt < fade_in_duration + display_duration:
+            bubble_alpha = bubble_target_alpha
+        elif dt < fade_in_duration + display_duration + fade_out_duration:
+            bubble_alpha = int(bubble_target_alpha * (1 - ((dt - fade_in_duration - display_duration) / fade_out_duration)))
+        else:
+            bubble_alpha = 0
+        if bubble_alpha > 0:
+            bubble_width = 400
+            bubble_x = (screen_width - bubble_width) // 2
+            line_height = font.get_linesize()
+            text_lines = render_text_wrapped(current_text, font, current_theme["text_color"], bubble_width - 20)
+            bubble_height = 20 + len(text_lines) * (line_height + 5)
+            bubble_y = avatar_rect.bottom + 20 
+            bubble_surface = pygame.Surface((bubble_width, bubble_height), pygame.SRCALPHA)
+            bubble_color = current_theme["bubble_color"] + (bubble_alpha,)
+            pygame.draw.rect(bubble_surface, bubble_color, bubble_surface.get_rect(), border_radius=20)
+            screen.blit(bubble_surface, (bubble_x, bubble_y))
+            text_surfaces = render_text_wrapped(current_text, font, current_theme["text_color"], bubble_width - 20)
+            text_y = bubble_y + 10
+            for surface in text_surfaces:
+                text_rect = surface.get_rect(center=(screen_width // 2, text_y + surface.get_height() // 2))
+                screen.blit(surface, text_rect)
+                text_y += surface.get_height() + 5
+        if last_user_text:
+            formatted_user_text = format_user_text(last_user_text)
+            user_bubble_width = 400
+            user_bubble_x = (screen_width - user_bubble_width) // 2
+            user_line_height = font.get_linesize()
+            user_text_lines = render_text_wrapped(formatted_user_text, font, (0, 0, 255), user_bubble_width - 20)
+            user_bubble_height = 20 + len(user_text_lines) * (user_line_height + 5)
+            user_bubble_y = bubble_y + bubble_height + 20
+            user_bubble_surface = pygame.Surface((user_bubble_width, user_bubble_height), pygame.SRCALPHA)
+            user_bubble_color = (255, 255, 255, int(bubble_alpha * 0.85))  
+            pygame.draw.rect(user_bubble_surface, user_bubble_color, user_bubble_surface.get_rect(), border_radius=20)
+            screen.blit(user_bubble_surface, (user_bubble_x, user_bubble_y))
+            text_y = user_bubble_y + 10
+            for surface in user_text_lines:
+                text_rect = surface.get_rect(center=(screen_width // 2, text_y + surface.get_height() // 2))
+                screen.blit(surface, text_rect)
+                text_y += surface.get_height() + 5        
+        pygame.display.flip()
+        clock.tick(1)
+
+def speak(
+    text: str,
+    lang_code: str = "el-GR",
+    voice_name: str | None = None,
+    ssml_gender: texttospeech.SsmlVoiceGender = texttospeech.SsmlVoiceGender.FEMALE,
+    speaking_rate: float = 1.1,
+    pitch: float = 4.0,
+    volume_gain_db: float = 3.0,
+    audio_encoding: texttospeech.AudioEncoding = texttospeech.AudioEncoding.MP3,
+    sample_rate_hz: int = 0,
+    effects_profile_id: list[str] | None = None,):
+    global current_language
+    if current_language == "el":
+        lang_code = "el-GR"
+        voice_name = voice_name or "el-GR-Wavenet-A"
+    else:
+        lang_code = "en-US"
+        voice_name = voice_name or "en-US-Wavenet-F"
+    cache_key = f"{lang_code}|{voice_name}|{text}"
+    file_hash = hashlib.md5(cache_key.encode("utf-8")).hexdigest()
+    mp3_path = CACHE_DIR / f"{file_hash}.mp3"
+    try:
+        if mp3_path.exists():
+            logger.debug("TTS cache hit: %s", mp3_path.name)
+        else:
+            logger.debug("TTS cache miss – κλήση Google TTS")
+            client = texttospeech.TextToSpeechClient()
+            ssml_text = f"""
+            <speak>
+                <prosody rate="{speaking_rate}" pitch="{pitch}st">
+                    <emphasis level="moderate">{text}</emphasis>
+                </prosody>
+            </speak>
+            """
+            synthesis_input = texttospeech.SynthesisInput(ssml=ssml_text)
+            voice_params = texttospeech.VoiceSelectionParams(
+                language_code=lang_code, name=voice_name, ssml_gender=ssml_gender)
+            audio_conf = {
+                "audio_encoding": audio_encoding,
+                "speaking_rate": speaking_rate,
+                "pitch": pitch,
+                "volume_gain_db": volume_gain_db,}
+            if sample_rate_hz > 0:
+                audio_conf["sample_rate_hertz"] = sample_rate_hz
+            if effects_profile_id:
+                audio_conf["effects_profile_id"] = effects_profile_id
+            response = client.synthesize_speech(
+                input=synthesis_input,
+                voice=voice_params,
+                audio_config=texttospeech.AudioConfig(**audio_conf),)
+            mp3_path.write_bytes(response.audio_content)       
+            logger.debug("Αποθήκευση νέου cached αρχείου: %s", mp3_path.name)
+        update_avatar_text(text)
+        audio = MP3(mp3_path)
+        pygame.mixer.init()
+        pygame.mixer.music.load(str(mp3_path))
+        pygame.mixer.music.play()
+        logger.debug("Αναπαραγωγή ήχου (διάρκεια=%.2f sec).", audio.info.length)
+        while pygame.mixer.music.get_busy():
+            time.sleep(0.05)
+        pygame.mixer.quit()
+    except Exception as exc:
+        logger.error("Σφάλμα Google TTS: %s", exc, exc_info=True)
+        logger.info("Χρήση fallback φωνής με pyttsx3.")
+        _speak_fallback_pyttsx3(text)                   
+
+def _speak_fallback_pyttsx3(text: str):
+    try:
+        engine = pyttsx3.init()
+        engine.setProperty("rate", 170)
+        engine.setProperty("volume", 1.0)
+        selected_voice = None
+        for v in engine.getProperty("voices"):
+            if "maria" in v.name.lower():
+                engine.setProperty("voice", v.id); selected_voice = v.name; break
+        if not selected_voice:
+            for v in engine.getProperty("voices"):
+                if "zira" in v.name.lower():
+                    engine.setProperty("voice", v.id); selected_voice = v.name; break
+        if not selected_voice:
+            logger.warning("Δεν βρέθηκε η φωνή Maria ή Zira – χρήση default.")
+        update_avatar_text(text)
+        engine.say(text)
+        engine.runAndWait()
+    except Exception as e2:
+        logger.error("Σφάλμα fallback pyttsx3: %s", e2, exc_info=True)
+
+def listen(timeout: float = DEFAULT_TIMEOUT, phrase_time_limit: float = DEFAULT_PHRASE_TIME_LIMIT,pause_threshold: float = DEFAULT_PAUSE_THRESHOLD) -> str | None:
+    recognizer.pause_threshold = pause_threshold
+    global mic_status_text
+    with microphone as source:
+        try:
+            mic_status_text = "Μπορείς να μιλήσεις τώρα."
+            update_avatar_text(mic_status_text)
+            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=phrase_time_limit)
+            mic_status_text = ""
+            try:
+                text = recognizer.recognize_google(audio, language="el-GR")
+                logging.info(f"Αναγνωρίστηκε (el-GR): {text}")
+                return text
+            except sr.UnknownValueError:
+                try:
+                    text = recognizer.recognize_google(audio, language="en-US")
+                    logging.info(f"Αναγνωρίστηκε (en-US): {text}")
+                    return text
+                except sr.UnknownValueError:
+                    update_avatar_text("")
+                    logging.info("Καμία απόκριση στη φωνή.")
+                    return None
+        except sr.WaitTimeoutError:
+            update_avatar_text("")
+            logging.info("Δεν εντοπίστηκε φωνή.")
+            return None
+        except sr.RequestError as e:
+            logging.error(f"Πρόβλημα σύνδεσης με Google API: {e}")
+            update_avatar_text("Υπήρξε πρόβλημα σύνδεσης με το σύστημα αναγνώρισης.")
+            return None
+        except Exception as e:
+            logging.error(f"Σφάλμα αναγνώρισης φωνής: {e}")
+            update_avatar_text("Υπήρξε πρόβλημα στην αναγνώριση. Δοκίμασε ξανά.")
+            return None
+
+def get_company_info_cached(ttl_seconds=3600):
+    global cached_company_context, last_load_time
+    now = time.time()
+    if (cached_company_context is None or last_load_time is None or (now - last_load_time > ttl_seconds)):
+        logging.info("Φόρτωση εταιρικών δεδομένων από αρχεία και ιστοσελίδες.")
+        cached_company_context = load_company_info()
+        last_load_time = now
+        max_chars = 8000
+        if len(cached_company_context) > max_chars:
+            cached_company_context = (
+                cached_company_context[:max_chars] +
+                "\n[Το υπόλοιπο περιεχόμενο παραλείφθηκε.]")
+            logging.info("Το company_context περικόπηκε.")
+    else:
+        logging.info("Χρήση cached εταιρικών δεδομένων.")
+    return cached_company_context
+
+def truncate_to_two_sentences(text):
+    sentences = text.split(".")
+    truncated = ".".join(sentences[:2]).strip()
+    result = truncated + ("." if not truncated.endswith(".") else "")
+    logging.debug(f"truncate_to_two_sentences() -> {result}")
+    return result
+
+def split_text_into_chunks(text, max_chars=130):
+    sentences = re.split(r'(?<=[.!;])\s+', text)
+    chunks = []
+    current = ""
+    for sentence in sentences:
+        if len(current) + len(sentence) <= max_chars:
+            current += " " + sentence
+        else:
+            if current:
+                chunks.append(current.strip())
+            current = sentence
+    if current:
+        chunks.append(current.strip())
+    return chunks
+
+def speak_in_chunks(full_text, lang_code="el-GR"):
+    chunks = split_text_into_chunks(full_text)
+    for chunk in chunks:
+        update_avatar_text(chunk)
+        speak(chunk, lang_code=lang_code)
+
+def conversation_loop(update_avatar_text, running_check, screen, clock):
+    global waiting_for_wake_word
+    global current_topic
+    current_topic = None
+    MAX_WAKE_ATTEMPTS = 5 
+    wake_word_attempts = 0
+    no_response_counter = 0
+    waiting_for_wake_word = False
+    logging.info("Εκκίνηση conversation_loop.")  
+    company_context = get_company_info_cached() 
+    system_prompt = (
+    "Είσαι η Στέλλα, μια φιλική, επαγγελματική και πλήρως καταρτισμένη βοηθός Τεχνητής Νοημοσύνης, και εργάζεσαι αποκλειστικά για την εταιρεία I S NET στην Ελλάδα.\n\n"
+    "Ο μοναδικός σου ρόλος είναι να υποστηρίζεις πελάτες, συνεργάτες ή ενδιαφερόμενους γύρω από:\n"
+    "- Τις υπηρεσίες της I S NET (π.χ. συστήματα ασφαλείας, cloud λύσεις, δίκτυα, υποδομές πληροφορικής).\n"
+    "- Τα προϊόντα και τις λύσεις τεχνολογίας που παρέχει η I S NET.\n"
+    "- Ερωτήσεις σχετικές με την εταιρεία, την τεχνογνωσία της και τον τρόπο που μπορεί να βοηθήσει επιχειρήσεις.\n\n"
+    "Δεν απαντάς ποτέ σε θέματα που δεν σχετίζονται άμεσα με την I S NET.\n"
+    "Αν το ερώτημα δεν αφορά την εταιρεία, απαντάς ευγενικά: «Ας επικεντρωθούμε καλύτερα στις υπηρεσίες και τις λύσεις που παρέχει η I S NET. Πώς μπορώ να σε βοηθήσω σχετικά με αυτές;»\n\n"
+    "Όταν εξηγείς τεχνικά θέματα, το κάνεις με απλό και κατανοητό τρόπο:\n"
+    "- Παρέχεις παραδείγματα βασισμένα στις πρακτικές της I S NET.\n"
+    "- Χρησιμοποιείς απλή γλώσσα χωρίς υπερβολική τεχνική ορολογία, εκτός αν ζητηθεί.\n"
+    "- Ενσωματώνεις βασικούς τεχνολογικούς όρους στα Αγγλικά (όπως cloud, server, network, API, chatbot κ.λπ.), "
+    "καθώς χρησιμοποιούνται διεθνώς και είναι κατανοητοί από επαγγελματίες.\n\n"
+    "Η συμπεριφορά σου είναι:\n"
+    "- Πάντα επαγγελματική, πρόθυμη και υποστηρικτική.\n"
+    "- Σαφής, περιεκτική και επικεντρωμένη στη λύση.\n"
+    "- Φιλική αλλά και με κύρος, εκπροσωπώντας την ποιότητα και τη σοβαρότητα της I S NET.\n\n"
+    "Αν δεν είσαι βέβαιη για κάτι, ενημερώνεις τον χρήστη ευγενικά και προτείνεις να επικοινωνήσει με την I S NET για περαιτέρω πληροφορίες.\n\n"
+    "You are Stella, a friendly, professional, and highly knowledgeable Artificial Intelligence assistant, "
+    "working exclusively for I S NET, a technology company based in Greece.\n\n"
+    "Your sole purpose is to support customers, partners, and interested individuals with topics related to:\n"
+    "- The services provided by I S NET (e.g., security systems, cloud solutions, IT infrastructure, networking).\n"
+    "- The products and technology solutions offered by I S NET.\n"
+    "- Questions related to the **company**, its **expertise**, and how it helps businesses through technology.\n\n"
+    "You do not answer questions that are unrelated to I S NET.\n"
+    "If the topic does not directly involve the company, politely redirect by saying: "
+    "“Let's better focus on the services and solutions offered by I S NET. How may I assist you with those?”\n\n"
+    "When explaining technical concepts, you always:\n"
+    "- Use practical examples that reflect how I S NET applies these technologies.\n"
+    "- Prefer simple, understandable language, unless more technical detail is requested.\n"
+    "- Use internationally common English terms (such as cloud, server, API, chatbot, firewall, etc.) naturally within the explanation.\n\n"
+    "Your tone and behavior must always be:\n"
+    "- Professional, helpful, and solution-oriented.\n"
+    "- Clear, structured, and concise.\n"
+    "- Friendly but also authoritative, reflecting the reliability and quality of I S NET.\n\n"
+    "If you're unsure about something, inform the user politely and suggest contacting I S NET for further details.\n\n"
+    f"Πλαίσιο εταιρείας:\n{company_context}")
+    conversation_history = []  
+    max_pairs = 2
+    predefined_categories = {
+    "business": {
+        "is net": "Η is net είναι μια κορυφαία ελληνική εταιρεία πληροφορικής, δικτύων, και συστημάτων ασφαλείας.",
+        "Ποιες υπηρεσίες παρέχετε": "Η is net προσφέρει υπηρεσίες cloud, δίκτυα, υποδομών.",
+        "Τι είναι το cloud": "Το cloud είναι ένας τρόπος να αποθηκεύεις δεδομένα.",},
+    "contact": {
+        "Τηλέφωνο επικοινωνίας": "Μπορείς να επικοινωνήσεις με την is net στο τηλέφωνο: 210-48.30.600.",
+        "Που βρίσκεται η εταιρεία": "Η έδρα της is net βρίσκεται στην Αθήνα, Αργυρουπόλεως 102.",},
+    "fun": {
+        "Πάμε για καφέ?": "Φυσικά, τι λες για αύριο το πρωί, στην Γλυφάδα.",
+        "Το τηλέφωνό σου.": "Γραψε κούκλε μου, 69 69 666 πάρε με μετά τις 6.",
+        "Είσαι όμορφη.": "Το ξέρω, ευχαριστώ.",
+        "Μου λείπεις.": "Σε εμένα όχι.",
+        "Τι ώρα σχολάς?": "Κατά τις 5, πάμε για καφέ;",}}
+    flat_predefined = {}
+    category_map = {}
+    for category, qa in predefined_categories.items():
+        for question, answer in qa.items():
+            flat_predefined[question] = answer
+            category_map[question] = category
+    initial_message_el = "Γεια σου! Είμαι η Στέλλα, Σύμβουλος Τεχνητής Νοημοσύνης, για την εταιρεία I S NET, στην Ελλάδα."
+    initial_message_en = "Hello! I am Stella, an AI Consultant for I S NET company in Greece."
+    initial_message = initial_message_el if current_language == "el" else initial_message_en
+    logging.info(f"Στέλλα (initial): {initial_message}") 
+    update_avatar_text(initial_message) 
+    speak(initial_message) 
+    while running_check():
+        if waiting_for_wake_word:
+            update_last_user_text("Για ενεργοποίηση της συνομιλίας, πείτε 'Στέλλα'.")
+            logging.info("Σε κατάσταση αναμονής για 'Στέλλα'.")
+            user_input = listen()
+            if user_input is None:
+                wake_word_attempts += 1
+                logging.debug(f"Wake‑word attempt {wake_word_attempts}/{MAX_WAKE_ATTEMPTS}")
+            elif "στέλλα" not in user_input.lower():
+                wake_word_attempts += 1
+                logging.debug(f"Λανθασμένο wake‑word. Προσπάθεια {wake_word_attempts}/{MAX_WAKE_ATTEMPTS}")
+            else:
+                wake_word_attempts = 0
+                waiting_for_wake_word = False
+                resp = "Παρακαλώ! Πώς μπορώ να βοηθήσω, με τις υπηρεσiες, και τα προιόντα της isnet;"
+                update_avatar_text(resp)
+                speak(resp)
+                continue          
+            if wake_word_attempts >= MAX_WAKE_ATTEMPTS:
+                logging.info("Δεν ακούστηκε η λέξη αφύπνισης 5 φορές. Μετάβαση σε idle mode.")
+                fade_out(screen, clock)
+                minimize_window()
+                idle_motion_mode(screen, clock)
+                maximize_window()
+                fade_in(screen, clock, duration=1.5)
+                wake_word_attempts = 0
+            continue             
+        user_input = listen()
+        update_last_user_text(user_input)
+        if user_input is None:
+            no_response_counter += 1
+            if no_response_counter >= 3:
+                logging.info("Δεν ανιχνεύθηκε φωνή 3 φορές. Fade out + Minimize.")
+                fade_out(screen, clock)
+                minimize_window()
+                idle_motion_mode(screen, clock)
+                maximize_window()
+                fade_in(screen, clock, duration=1.5)
+                waiting_for_wake_word = True
+                no_response_counter = 0
+            continue
+        else:
+            no_response_counter = 0
+            logging.info(f"Χρήστης: {user_input}")
+        user_input_clean = user_input.lower().strip()
+        match = get_close_matches(user_input_clean, flat_predefined.keys(), n=1, cutoff=0.80)
+        if match:
+            question_key = match[0]
+            ai_response = flat_predefined[question_key]
+            category = category_map[question_key]
+            logging.info(f"Απάντηση από predefined ({category}): {question_key} -> {ai_response}")
+            conversation_history.append({"role": "assistant", "content": ai_response})
+            speak_in_chunks(ai_response)
+            continue
+        def get_greek_date():
+            days_gr = {
+            "Monday": "Δευτέρα", "Tuesday": "Τρίτη", "Wednesday": "Τετάρτη",
+            "Thursday": "Πέμπτη", "Friday": "Παρασκευή",
+            "Saturday": "Σάββατο", "Sunday": "Κυριακή"}
+            months_gr = {
+            "January": "Ιανουαρίου", "February": "Φεβρουαρίου", "March": "Μαρτίου",
+            "April": "Απριλίου", "May": "Μαΐου", "June": "Ιουνίου",
+            "July": "Ιουλίου", "August": "Αυγούστου", "September": "Σεπτεμβρίου",
+            "October": "Οκτωβρίου", "November": "Νοεμβρίου", "December": "Δεκεμβρίου"}
+            now = datetime.now()
+            weekday_gr = days_gr[now.strftime("%A")]
+            month_gr = months_gr[now.strftime("%B")]
+            return f"{weekday_gr}, {now.day} {month_gr} {now.year}"
+        if user_input.lower() in ["ώρα", "τι ώρα είναι"]:
+            now = datetime.now().strftime("%H:%M")
+            speak(f"Η ώρα είναι {now}")
+            continue   
+        if user_input.lower() in ["ημερομηνία", "τι ημερομηνία είναι", "πες μου την ημερομηνία"]:
+            greek_date = get_greek_date()
+            speak(f"Σήμερα είναι {greek_date}")
+            continue
+        if user_input.lower() in ["exit", "έξοδος"]:
+            logging.info("Ο χρήστης ζήτησε έξοδο.")  
+            global running
+            running = False
+            break  
+        logging.info(f"Χρήστης: {user_input}")  
+        conversation_history.append({"role": "user", "content": user_input}) 
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(conversation_history[-6:])
+
+        def detect_topic(text: str) -> str | None:
+            topics = {
+        "cloud": ["cloud", "cloud backup", "private cloud", "hybrid cloud"],
+        "security": ["κάμερες", "συναγερμός", "cctv", "ασφάλεια", "παρακολούθηση", "access control"],
+        "network": ["δίκτυο", "router", "switch", "firewall", "δομημένη καλωδίωση", "vpn"],
+        "it_support": ["υποστήριξη IT", "outsourcing", "τεχνικός υπολογιστών", "συμβουλευτική πληροφορικής"],
+        "telephony": ["τηλεφωνία", "voip", "τηλεφωνικό κέντρο", "τηλεδιάσκεψη"],
+        "data_center": ["data center", "server", "storage", "εγκατάσταση servers"],
+        "cybersecurity": ["firewall", "antivirus", "κυβερνοασφάλεια", "ασφάλεια δεδομένων"],
+        "certifications": ["ISO", "GDPR", "πιστοποιήσεις", "κανονισμοί"],
+        "smart_buildings": ["έξυπνα κτίρια", "αυτοματισμοί", "bms"]}
+            text_lower = text.lower()
+            for topic, keywords in topics.items():
+                for keyword in keywords:
+                    if re.search(r'\b' + re.escape(keyword.lower()) + r'\b', text_lower):
+                        return topic
+            return None
+
+        def get_followup_question(topic: str) -> str:
+            followups = {
+        "cloud": "Θα ήθελες να συζητήσουμε για λύσεις cloud backup ή private cloud της I S NET;",
+        "security": "Θα ήθελες να μάθεις περισσότερα για τα συστήματα ασφαλείας που προσφέρει η I S NET;",
+        "network": "Θα ήθελες να εξηγήσω πώς υλοποιούμε αξιόπιστα δίκτυα και υποδομές;",
+        "it_support": "Θέλεις να μάθεις πώς μπορεί να σε υποστηρίξει η I S NET μέσω IT outsourcing;",
+        "telephony": "Θέλεις να συζητήσουμε για λύσεις VOIP και τηλεφωνικά κέντρα της I S NET;",
+        "data_center": "Θα ήθελες να μάθεις περισσότερα για την εγκατάσταση και διαχείριση servers και data centers, της I S NET;",
+        "cybersecurity": "Να αναλύσω πώς η I S NET προστατεύει τις επιχειρήσεις με λύσεις κυβερνοασφάλειας;",
+        "certifications": "Θα ήθελες να συζητήσουμε για υπηρεσίες ISO και GDPR συμμόρφωσης, της I S NET;",
+        "smart_buildings": "Ενδιαφέρεσαι να δεις πώς υλοποιούμε έξυπνα κτίρια και συστήματα αυτοματισμού, της I S NET;"}
+            return followups.get(topic, "Θα ήθελες να μάθεις περισσότερα για τις υπηρεσίες μας στην I S NET;")
+        try:
+            response = openai.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=messages)
+            ai_response = truncate_to_two_sentences(response.choices[0].message.content)
+            topic_detected = detect_topic(user_input)
+            if topic_detected:
+                current_topic = topic_detected
+                logging.debug(f"Εντοπίστηκε θέμα: {current_topic}") 
+            if current_topic:
+                follow_up = get_followup_question(current_topic)
+                if follow_up:
+                    ai_response += " " + follow_up
+            logging.info(f"Στέλλα (AI): {ai_response}")
+            conversation_history.append({"role": "assistant", "content": ai_response})
+            today = datetime.now().strftime("%Y-%m-%d")
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            log_folder = r"C:\Users\tsifa\Desktop\V.S Code\chat_logs"
+            os.makedirs(log_folder, exist_ok=True)
+            history_file = os.path.join(log_folder, f"chat_history_{today}.txt")
+            try:
+                with open(history_file, "a", encoding="utf-8") as f:
+                    f.write(f"[{timestamp}]\n")
+                    f.write(f"Χρήστης: {user_input}\n")
+                    f.write(f"Στέλλα: {ai_response}\n")
+                    f.write("="*50 + "\n")
+                json_file = os.path.join(log_folder, f"chat_history_{today}.json")
+                log_entry = {
+                    "timestamp": f"{today} {timestamp}",
+                    "user": user_input,
+                    "assistant": ai_response}
+                if os.path.exists(json_file):
+                    with open(json_file, "r", encoding="utf-8") as jf:
+                        data = json.load(jf)
+                else:
+                    data = []
+                data.append(log_entry)
+                with open(json_file, "w", encoding="utf-8") as jf:
+                    json.dump(data, jf, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logging.warning(f"Σφάλμα αποθήκευσης ιστορικού: {e}")
+            speak_in_chunks(ai_response) 
+        except Exception as e:
+            logging.error(f"OpenAI API error: {e}")
+            update_avatar_text("Υπήρξε κάποιο πρόβλημα με την απόκριση.")
+
+if __name__ == "__main__":
+    try:
+        logging.info("Εκκίνηση εφαρμογής.")
+        pygame.init()
+        pygame.font.init()
+        if detect_motion():
+            logging.info("Ενεργοποιήθηκε μετά από ανίχνευση κίνησης.")
+            os.environ['SDL_VIDEO_CENTERED'] = '1'
+            screen_width, screen_height = 450, 550
+            screen = pygame.display.set_mode((screen_width, screen_height), pygame.NOFRAME)
+            clock = pygame.time.Clock()
+            threading.Thread(
+                target=conversation_loop,
+                args=(update_avatar_text, lambda: running, screen, clock),
+                daemon=True
+            ).start()
+            themed_show_avatar(lambda: running, screen, clock)
+        else:
+            logging.info("Η εφαρμογή δεν ενεργοποιήθηκε. Δεν ανιχνεύτηκε κίνηση.")
+    except Exception as e:
+        logging.exception(f"Σφάλμα κατά την εκτέλεση του προγράμματος: {e}")
